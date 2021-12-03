@@ -162,6 +162,7 @@ class Outlooker(nn.Module):
             x1 = x1 / 2 + self.drop_path(self.attn(self.norm1(x1)))
             x1 = x1 / 2 + self.drop_path(self.mlp(self.norm2(x1)))
             x = torch.cat((x1, x2), dim=3)
+            x = x.reshape(x.shape[0], x.shape[1], x.shape[2], 2, x.shape[3]//2).transpose(-1, -2).reshape(x.shape[0], x.shape[1], x.shape[2], -1)
         return x
     
     def MACs(self, N):
@@ -293,6 +294,7 @@ class Transformer(nn.Module):
             x1 = x1 / 2 + self.drop_path(self.attn(self.norm1(x1)))
             x1 = x1 / 2 + self.drop_path(self.mlp(self.norm2(x1)))
             x = torch.cat((x1, x2), dim=3)
+            x = x.reshape(x.shape[0], x.shape[1], x.shape[2], 2, x.shape[3]//2).transpose(-1, -2).reshape(x.shape[0], x.shape[1], x.shape[2], -1)
         return x
       
     def MACs(self, N):
