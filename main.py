@@ -101,6 +101,9 @@ parser.add_argument('-b', '--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 128)')
 parser.add_argument('-vb', '--validation-batch-size-multiplier', type=int, default=1, metavar='N',
                     help='ratio of validation batch size to training batch size (default: 1)')
+parser.add_argument('--shuffle', default=False, type=bool,
+                    help='channel shuffle or not')
+                    
 
 # Optimizer parameters
 parser.add_argument('--opt', default='adamw', type=str, metavar='OPTIMIZER',
@@ -359,7 +362,8 @@ def main():
         bn_eps=args.bn_eps,
         scriptable=args.torchscript,
         checkpoint_path=args.initial_checkpoint,
-        img_size=args.img_size)
+        img_size=args.img_size,
+        shuffle=args.shuffle)
     if args.num_classes is None:
         assert hasattr(
             model, 'num_classes'
@@ -374,9 +378,10 @@ def main():
                                 num_classes=args.num_classes)
 
     if args.local_rank == 0:
-        _logger.info('Model %s created, param count: %d' %
-                     (args.model, sum([m.numel()
-                                       for m in model.parameters()])))
+        _logger.info('Model %s created, param count: %d, MACs: %.3fG' %
+                     (args.model, 
+                      sum([m.numel() for m in model.parameters()]),
+                      model.MACs()/(1e9)))
 
     data_config = resolve_data_config(vars(args),
                                       model=model,

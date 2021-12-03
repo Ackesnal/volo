@@ -17,6 +17,7 @@ Vision OutLOoker (VOLO) implementation
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
@@ -55,6 +56,7 @@ class OutlookAttention(nn.Module):
                  qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
         super().__init__()
         head_dim = dim // num_heads
+        self.dim = dim
         self.num_heads = num_heads
         self.kernel_size = kernel_size
         self.padding = padding
@@ -79,26 +81,40 @@ class OutlookAttention(nn.Module):
         h, w = math.ceil(H / self.stride), math.ceil(W / self.stride)
         v = self.unfold(v).reshape(B, self.num_heads, C // self.num_heads,
                                    self.kernel_size * self.kernel_size,
-                                   h * w).permute(0, 1, 4, 3, 2)  # B,H,N,kxk,C/H
+                                   h * w).permute(0, 1, 4, 3, 2)  # B, N, H*W, kxk, C/N
 
-        attn = self.pool(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        attn = self.pool(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1) # attn: B, H/S, W/S, C (S=1)
         attn = self.attn(attn).reshape(
             B, h * w, self.num_heads, self.kernel_size * self.kernel_size,
-            self.kernel_size * self.kernel_size).permute(0, 2, 1, 3, 4)  # B,H,N,kxk,kxk
+            self.kernel_size * self.kernel_size).permute(0, 2, 1, 3, 4)  # B, N, H*W, kxk, kxk
         attn = attn * self.scale
         attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        attn = self.attn_drop(attn) # B, H*W, N, kxk, kxk
 
         x = (attn @ v).permute(0, 1, 4, 3, 2).reshape(
-            B, C * self.kernel_size * self.kernel_size, h * w)
+            B, C * self.kernel_size * self.kernel_size, h * w) 
+            # B, N, H*W, kxk, C/N => B, N, C/N, kxk, H*W => B, Cxkxk, H*W
         x = F.fold(x, output_size=(H, W), kernel_size=self.kernel_size,
-                   padding=self.padding, stride=self.stride)
+                   padding=self.padding, stride=self.stride) # B, C, H, W
 
         x = self.proj(x.permute(0, 2, 3, 1))
         x = self.proj_drop(x)
 
         return x
-
+        
+    def MACs(self, N):
+        macs = 0
+        # v = self.v(x)
+        macs = macs + N * self.dim * self.dim
+        # attn = self.pool(x.permute(0, 3, 1, 2))
+        macs = macs + self.dim * (self.stride ** 2) * (N / self.stride ** 2)
+        # attn = self.attn(attn)
+        macs = macs + (N / self.stride ** 2) * self.dim * (self.num_heads * (self.kernel_size ** 4))
+        # x = (attn @ v)
+        macs = macs + N * self.num_heads * (self.kernel_size ** 2) * (self.kernel_size ** 2) * (self.dim / self.num_heads)
+        # x = self.proj(x)
+        macs = macs + N * self.dim * self.dim
+        return macs
 
 class Outlooker(nn.Module):
     """
@@ -114,17 +130,22 @@ class Outlooker(nn.Module):
                  num_heads=1,mlp_ratio=3., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU,
                  norm_layer=nn.LayerNorm, qkv_bias=False,
-                 qk_scale=None):
+                 qk_scale=None, shuffle=False):
         super().__init__()
+        
+        self.shuffle = shuffle
+        if self.shuffle:
+            dim = dim // 2
+        self.dim = dim
         self.norm1 = norm_layer(dim)
         self.attn = OutlookAttention(dim, num_heads, kernel_size=kernel_size,
                                      padding=padding, stride=stride,
                                      qkv_bias=qkv_bias, qk_scale=qk_scale,
                                      attn_drop=attn_drop)
-
+    
         self.drop_path = DropPath(
-            drop_path) if drop_path > 0. else nn.Identity()
-
+                         drop_path) if drop_path > 0. else nn.Identity()
+    
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim,
@@ -132,9 +153,26 @@ class Outlooker(nn.Module):
                        act_layer=act_layer)
 
     def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        if not self.shuffle:
+            x = x + self.drop_path(self.attn(self.norm1(x)))
+            x = x + self.drop_path(self.mlp(self.norm2(x)))
+        else:
+            x1 = x[:, :, :, :x.shape[3]//2]
+            x2 = x[:, :, :, x.shape[3]//2:]
+            x1 = x1 / 2 + self.drop_path(self.attn(self.norm1(x1)))
+            x1 = x1 / 2 + self.drop_path(self.mlp(self.norm2(x1)))
+            x = torch.cat((x1, x2), dim=3)
         return x
+    
+    def MACs(self, N):
+        macs = 0
+        # OutlookAttention
+        macs = macs + self.dim * N
+        macs = macs + self.attn.MACs(N)
+        # MLP 
+        macs = macs + self.dim * N
+        macs = macs + self.mlp.MACs(N)
+        return macs
 
 
 class Mlp(nn.Module):
@@ -146,6 +184,9 @@ class Mlp(nn.Module):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
+        self.in_features = in_features
+        self.hidden_features = hidden_features
+        self.out_features = out_features
         self.fc1 = nn.Linear(in_features, hidden_features)
         self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features, out_features)
@@ -158,8 +199,16 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         x = self.drop(x)
         return x
-
-
+    
+    def MACs(self, N):
+        macs = 0
+        # x = self.fc1(x)
+        macs = macs + N * self.in_features * self.hidden_features
+        # x = self.fc2(x)
+        macs = macs + N * self.hidden_features * self.out_features
+        return macs
+        
+        
 class Attention(nn.Module):
     "Implementation of self-attention"
 
@@ -168,6 +217,7 @@ class Attention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
+        self.dim = dim
         self.scale = qk_scale or head_dim**-0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -192,7 +242,18 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
 
         return x
-
+        
+    def MACs(self, N):
+        macs = 0
+        # qkv = self.qkv(x)
+        macs = macs + N * self.dim * 3 * self.dim
+        # attn = (q @ k.transpose(-2, -1))
+        macs = macs + self.num_heads * N * (self.dim // self.num_heads) * N
+        #  x = (attn @ v)
+        macs = macs + self.num_heads * N * N * (self.dim // self.num_heads)
+        # x = self.proj(x)
+        macs= macs + N * self.dim * self.dim
+        return macs
 
 class Transformer(nn.Module):
     """
@@ -201,8 +262,13 @@ class Transformer(nn.Module):
     """
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False,
                  qk_scale=None, attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, shuffle=False):
         super().__init__()
+        
+        self.shuffle = shuffle
+        if self.shuffle:
+            dim = dim // 2
+        self.dim = dim
         self.norm1 = norm_layer(dim)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias,
                               qk_scale=qk_scale, attn_drop=attn_drop)
@@ -218,10 +284,26 @@ class Transformer(nn.Module):
                        act_layer=act_layer)
 
     def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        if not self.shuffle:
+            x = x + self.drop_path(self.attn(self.norm1(x)))
+            x = x + self.drop_path(self.mlp(self.norm2(x)))
+        else:
+            x1 = x[:, :, :, :x.shape[3]//2]
+            x2 = x[:, :, :, x.shape[3]//2:]
+            x1 = x1 / 2 + self.drop_path(self.attn(self.norm1(x1)))
+            x1 = x1 / 2 + self.drop_path(self.mlp(self.norm2(x1)))
+            x = torch.cat((x1, x2), dim=3)
         return x
-
+      
+    def MACs(self, N):
+        macs = 0
+        # Self-Attention
+        macs = macs + self.dim * N
+        macs = macs + self.attn.MACs(N)
+        # MLP 
+        macs = macs + self.dim * N
+        macs = macs + self.mlp.MACs(N)
+        return macs
 
 class ClassAttention(nn.Module):
     """
@@ -231,6 +313,7 @@ class ClassAttention(nn.Module):
     def __init__(self, dim, num_heads=8, head_dim=None, qkv_bias=False,
                  qk_scale=None, attn_drop=0., proj_drop=0.):
         super().__init__()
+        self.dim = dim
         self.num_heads = num_heads
         if head_dim is not None:
             self.head_dim = head_dim
@@ -251,11 +334,11 @@ class ClassAttention(nn.Module):
         B, N, C = x.shape
 
         kv = self.kv(x).reshape(B, N, 2, self.num_heads,
-                                self.head_dim).permute(2, 0, 3, 1, 4)
+                                self.head_dim).permute(2, 0, 3, 1, 4) # 2, B, N, H*W, C/N 
         k, v = kv[0], kv[
-            1]  # make torchscript happy (cannot use tensor as tuple)
-        q = self.q(x[:, :1, :]).reshape(B, self.num_heads, 1, self.head_dim)
-        attn = ((q * self.scale) @ k.transpose(-2, -1))
+            1]  # make torchscript happy (cannot use tensor as tuple) 
+        q = self.q(x[:, :1, :]).reshape(B, self.num_heads, 1, self.head_dim) # B, N, 1, C/N
+        attn = ((q * self.scale) @ k.transpose(-2, -1)) # B, N, 1, H*W
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -264,6 +347,20 @@ class ClassAttention(nn.Module):
         cls_embed = self.proj(cls_embed)
         cls_embed = self.proj_drop(cls_embed)
         return cls_embed
+    
+    def MACs(self, N):
+        macs = 0
+        # kv = self.kv(x)
+        macs = macs + N * self.dim * 2 * self.dim
+        # q = self.q(x[:, :1, :])
+        macs = macs + self.dim * self.head_dim * self.num_heads
+        # attn = ((q * self.scale) @ k.transpose(-2, -1))
+        macs = macs + self.num_heads * 1 * self.head_dim * N
+        # cls_embed = (attn @ v)
+        macs = macs + self.num_heads * 1 * N * self.head_dim
+        # x = self.proj(x)
+        macs= macs + N * self.dim * self.dim
+        return macs
 
 
 class ClassBlock(nn.Module):
@@ -276,6 +373,7 @@ class ClassBlock(nn.Module):
                  qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
+        self.dim = dim
         self.norm1 = norm_layer(dim)
         self.attn = ClassAttention(
             dim, num_heads=num_heads, head_dim=head_dim, qkv_bias=qkv_bias,
@@ -285,6 +383,7 @@ class ClassBlock(nn.Module):
             drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp_hidden_dim = mlp_hidden_dim
         self.mlp = Mlp(in_features=dim,
                        hidden_features=mlp_hidden_dim,
                        act_layer=act_layer,
@@ -295,6 +394,16 @@ class ClassBlock(nn.Module):
         cls_embed = cls_embed + self.drop_path(self.attn(self.norm1(x)))
         cls_embed = cls_embed + self.drop_path(self.mlp(self.norm2(cls_embed)))
         return torch.cat([cls_embed, x[:, 1:]], dim=1)
+    
+    def MACs(self, N):
+        macs = 0
+        # cls_embed = cls_embed + self.drop_path(self.attn(self.norm1(x)))
+        macs = macs + N * self.dim
+        macs = macs + self.attn.MACs(N)
+        # cls_embed = cls_embed + self.drop_path(self.mlp(self.norm2(cls_embed)))
+        macs = macs + N * self.dim
+        macs = macs + self.mlp.MACs(N)
+        return macs
 
 
 def get_block(block_type, **kargs):
@@ -335,11 +444,17 @@ class PatchEmbed(nn.Module):
     """
 
     def __init__(self, img_size=224, stem_conv=False, stem_stride=1,
-                 patch_size=8, in_chans=3, hidden_dim=64, embed_dim=384):
+                 patch_size=8, in_chans=3, hidden_dim=64, embed_dim=384, shuffle=False):
         super().__init__()
         assert patch_size in [4, 8, 16]
-
+        self.in_chans = in_chans
+        self.hidden_dim = hidden_dim
+        self.embed_dim = embed_dim
         self.stem_conv = stem_conv
+        self.stride = stem_stride
+        self.patch_size = patch_size
+        self.shuffle = shuffle
+        
         if stem_conv:
             self.conv = nn.Sequential(
                 nn.Conv2d(in_chans, hidden_dim, kernel_size=7, stride=stem_stride,
@@ -367,27 +482,66 @@ class PatchEmbed(nn.Module):
             x = self.conv(x)
         x = self.proj(x)  # B, C, H, W
         return x
-
+    
+    def MACs(self, N):
+        macs = 0
+        if self.stem_conv:
+            # x = self.conv(x)
+            macs = macs + 7 * 7 * self.in_chans * (N / self.stride**2) * self.hidden_dim
+            print("Conv1: ", 7 * 7 * self.in_chans * (N / self.stride**2) * self.hidden_dim)
+            # macs = macs + (N / self.stride**2) * self.hidden_dim
+            macs = macs + 3 * 3 * self.hidden_dim * (N / self.stride**2) * self.hidden_dim
+            print("Conv2: ", 3 * 3 * self.hidden_dim * (N / self.stride**2) * self.hidden_dim)
+            # macs = macs + (N / self.stride**2) * self.hidden_dim
+            macs = macs + 3 * 3 * self.hidden_dim * (N / self.stride**2) * self.hidden_dim
+            print("Conv3: ", 3 * 3 * self.hidden_dim * (N / self.stride**2) * self.hidden_dim)
+            # macs = macs + (N / self.stride**2) * self.hidden_dim
+        macs = macs + ((self.patch_size // self.stride) ** 2) * self.hidden_dim * self.embed_dim * self.num_patches
+        print("Conv3: ", ((self.patch_size // self.stride) ** 2) * self.hidden_dim * self.embed_dim * self.num_patches)
+        return macs
 
 class Downsample(nn.Module):
     """
     Image to Patch Embedding, downsampling between stage1 and stage2
     """
-    def __init__(self, in_embed_dim, out_embed_dim, patch_size):
+    def __init__(self, in_embed_dim, out_embed_dim, patch_size, shuffle):
         super().__init__()
-        self.proj = nn.Conv2d(in_embed_dim, out_embed_dim,
-                              kernel_size=patch_size, stride=patch_size)
+        self.shuffle = shuffle
+        self.patch_size = patch_size
+        self.in_dim = in_embed_dim
+        self.out_dim = out_embed_dim
+        if not self.shuffle:
+            self.proj = nn.Conv2d(in_embed_dim, out_embed_dim,
+                                  kernel_size=patch_size, stride=patch_size)
+        else:
+            self.proj_1 = nn.Conv2d(in_embed_dim // 2, out_embed_dim // 2,
+                                    kernel_size=patch_size, stride=patch_size)
+            self.proj_2 = nn.Conv2d(in_embed_dim // 2, out_embed_dim // 2,
+                                    kernel_size=patch_size, stride=patch_size)
 
     def forward(self, x):
         x = x.permute(0, 3, 1, 2)
-        x = self.proj(x)  # B, C, H, W
+        if not self.shuffle:
+            x = self.proj(x)  # B, C, H, W
+        else:
+            x1 = self.proj_1(x[:, :x.shape[1]//2, :, :])
+            x2 = self.proj_2(x[:, x.shape[1]//2:, :, :])
+            x = torch.cat((x1, x2), dim = 1)
         x = x.permute(0, 2, 3, 1)
         return x
+        
+    def MACs(self, N):
+        macs = 0
+        if self.shuffle:
+            macs = macs + self.patch_size * self.patch_size * self.in_dim * self.out_dim * (N / self.patch_size ** 2)
+        else:
+            macs = macs + self.patch_size * self.patch_size * self.in_dim * self.out_dim * (N / self.patch_size ** 2) / 2
+        return macs
 
 
 def outlooker_blocks(block_fn, index, dim, layers, num_heads=1, kernel_size=3,
                      padding=1,stride=1, mlp_ratio=3., qkv_bias=False, qk_scale=None,
-                     attn_drop=0, drop_path_rate=0., **kwargs):
+                     attn_drop=0, drop_path_rate=0., shuffle = False, **kwargs):
     """
     generate outlooker layer in stage1
     return: outlooker layers
@@ -399,7 +553,7 @@ def outlooker_blocks(block_fn, index, dim, layers, num_heads=1, kernel_size=3,
         blocks.append(block_fn(dim, kernel_size=kernel_size, padding=padding,
                                stride=stride, num_heads=num_heads, mlp_ratio=mlp_ratio,
                                qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop,
-                               drop_path=block_dpr))
+                               drop_path=block_dpr, shuffle=shuffle))
 
     blocks = nn.Sequential(*blocks)
 
@@ -408,7 +562,7 @@ def outlooker_blocks(block_fn, index, dim, layers, num_heads=1, kernel_size=3,
 
 def transformer_blocks(block_fn, index, dim, layers, num_heads, mlp_ratio=3.,
                        qkv_bias=False, qk_scale=None, attn_drop=0,
-                       drop_path_rate=0., **kwargs):
+                       drop_path_rate=0., shuffle = False, **kwargs):
     """
     generate transformer layers in stage2
     return: transformer layers
@@ -423,7 +577,8 @@ def transformer_blocks(block_fn, index, dim, layers, num_heads, mlp_ratio=3.,
                      qkv_bias=qkv_bias,
                      qk_scale=qk_scale,
                      attn_drop=attn_drop,
-                     drop_path=block_dpr))
+                     drop_path=block_dpr,
+                     shuffle=shuffle))
 
     blocks = nn.Sequential(*blocks)
 
@@ -460,13 +615,21 @@ class VOLO(nn.Module):
                  outlook_attention=None, mlp_ratios=None, qkv_bias=False, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm,
                  post_layers=None, return_mean=False, return_dense=True, mix_token=True,
-                 pooling_scale=2, out_kernel=3, out_stride=2, out_padding=1):
+                 pooling_scale=2, out_kernel=3, out_stride=2, out_padding=1, shuffle=False):
 
         super().__init__()
+        self.shuffle = shuffle
+        self.resolution = img_size
+        self.embed_dims = embed_dims
+        
+        if shuffle:
+            embed_dims = [embed_dim * 2 for embed_dim in embed_dims]
+            #stem_hidden_dim = stem_hidden_dim * 2
+        
         self.num_classes = num_classes
         self.patch_embed = PatchEmbed(stem_conv=True, stem_stride=2, patch_size=patch_size,
                                       in_chans=in_chans, hidden_dim=stem_hidden_dim,
-                                      embed_dim=embed_dims[0])
+                                      embed_dim=embed_dims[0], shuffle = shuffle)
 
         # inital positional encoding, we add positional encoding after outlooker blocks
         self.pos_embed = nn.Parameter(
@@ -486,21 +649,22 @@ class VOLO(nn.Module):
                                          kernel_size=out_kernel, stride=out_stride,
                                          padding=out_padding, mlp_ratio=mlp_ratios[i],
                                          qkv_bias=qkv_bias, qk_scale=qk_scale,
-                                         attn_drop=attn_drop_rate, norm_layer=norm_layer)
+                                         attn_drop=attn_drop_rate, norm_layer=norm_layer,
+                                         shuffle=shuffle)
                 network.append(stage)
             else:
-                # stage 2
+                # stage 2, 3, 4
                 stage = transformer_blocks(Transformer, i, embed_dims[i], layers,
                                            num_heads[i], mlp_ratio=mlp_ratios[i],
                                            qkv_bias=qkv_bias, qk_scale=qk_scale,
                                            drop_path_rate=drop_path_rate,
                                            attn_drop=attn_drop_rate,
-                                           norm_layer=norm_layer)
+                                           norm_layer=norm_layer, shuffle=shuffle)
                 network.append(stage)
 
             if downsamples[i]:
                 # downsampling between two stages
-                network.append(Downsample(embed_dims[i], embed_dims[i + 1], 2))
+                network.append(Downsample(embed_dims[i], embed_dims[i + 1], 2, shuffle))
 
         self.network = nn.ModuleList(network)
 
@@ -578,7 +742,10 @@ class VOLO(nn.Module):
             if idx == 2:  # add positional encoding after outlooker blocks
                 x = x + self.pos_embed
                 x = self.pos_drop(x)
-            x = block(x)
+            if not self.shuffle:
+                x = block(x)
+            else:
+                x = checkpoint.checkpoint(block, x)
 
         B, H, W, C = x.shape
         x = x.reshape(B, -1, C)
@@ -643,6 +810,112 @@ class VOLO(nn.Module):
 
         # return these: 1. class token, 2. classes from all feature tokens, 3. bounding box
         return x_cls, x_aux, (bbx1, bby1, bbx2, bby2)
+      
+    def MACs(self):
+        macs = 0
+        # x = self.forward_embeddings(x)
+        macs = macs + self.patch_embed.MACs(self.resolution ** 2)
+        with open("MACs", "a") as fp:
+            fp.write("Patch embedding: %.3f MMACs\n" % (self.patch_embed.MACs(self.resolution ** 2) / 1e6))
+        # x = self.forward_tokens(x)
+        N = self.patch_embed.num_patches
+        for idx, block in enumerate(self.network):
+            if idx == 0:
+                for blk in block:
+                    macs = macs + blk.MACs(N)
+                    with open("MACs", "a") as fp:
+                        fp.write("Outlooker Layer: %.3f MMACs\n" % (blk.MACs(N) / 1e6))
+            elif idx == 1:
+                macs = macs + block.MACs(N)
+                with open("MACs", "a") as fp:
+                    fp.write("Downsampling Layer: %.3f MMACs\n" % (blk.MACs(N) / 1e6))
+            else:
+                for blk in block:
+                    macs = macs + blk.MACs(N / 4)
+                    with open("MACs", "a") as fp:
+                        fp.write("Transformer Layer: %.3f MMACs\n" % (blk.MACs(N / 4) / 1e6))
+        # x = self.forward_cls(x)
+        N = self.patch_embed.num_patches / 4
+        for block in self.post_network:
+            macs = macs + block.MACs(N)
+            with open("MACs", "a") as fp:
+                fp.write("Output Layer: %.3f MMACs\n" % (block.MACs(N) / 1e6))
+        # x = self.norm(x)
+        macs = macs + N * self.embed_dims[-1]
+        with open("MACs", "a") as fp:
+            fp.write("Normalisation Layer: %.3f MMACs\n" % (N * self.embed_dims[-1] / 1e6))
+        # x = x_aux = self.aux_head(x[:, 1:])
+        macs = macs + N * self.embed_dims[-1] * self.num_classes
+        with open("MACs", "a") as fp:
+            fp.write("Output Layer: %.3f MMACs\n" % (N * self.embed_dims[-1] * self.num_classes / 1e6))
+            fp.write("Total MACs: %.3f GMACs\n" % (macs / 1e9))
+        return macs
+        
+      
+@register_model
+def volo_d0(pretrained=False, **kwargs):
+    """
+    VOLO-D1 model, Params: 27M
+    --layers: [x,x,x,x], four blocks in two stages, the first stage(block) is outlooker,
+            the other three blocks are transformer, we set four blocks, which are easily
+             applied to downstream tasks
+    --embed_dims, --num_heads,: embedding dim, number of heads in each block
+    --downsamples: flags to apply downsampling or not in four blocks
+    --outlook_attention: flags to apply outlook attention or not
+    --mlp_ratios: mlp ratio in four blocks
+    --post_layers: post layers like two class attention layers using [ca, ca]
+    See detail for all args in the class VOLO()
+    """
+    layers = [4, 4, 8, 2]  # num of layers in the four blocks
+    embed_dims = [96, 192, 192, 192]
+    num_heads = [3, 6, 6, 6]
+    mlp_ratios = [3, 3, 3, 3]
+    downsamples = [True, False, False, False] # do downsampling after first block
+    outlook_attention = [True, False, False, False ]
+    # first block is outlooker (stage1), the other three are transformer (stage2)
+    model = VOLO(layers,
+                 embed_dims=embed_dims,
+                 num_heads=num_heads,
+                 mlp_ratios=mlp_ratios,
+                 downsamples=downsamples,
+                 outlook_attention=outlook_attention,
+                 post_layers=['ca', 'ca'],
+                 **kwargs)
+    model.default_cfg = default_cfgs['volo']
+    return model
+
+
+@register_model
+def volo_d0_shuffle(pretrained=False, **kwargs):
+    """
+    VOLO-D1 model, Params: 27M
+    --layers: [x,x,x,x], four blocks in two stages, the first stage(block) is outlooker,
+            the other three blocks are transformer, we set four blocks, which are easily
+             applied to downstream tasks
+    --embed_dims, --num_heads,: embedding dim, number of heads in each block
+    --downsamples: flags to apply downsampling or not in four blocks
+    --outlook_attention: flags to apply outlook attention or not
+    --mlp_ratios: mlp ratio in four blocks
+    --post_layers: post layers like two class attention layers using [ca, ca]
+    See detail for all args in the class VOLO()
+    """
+    layers = [2, 2, 4, 2]  # num of layers in the four blocks
+    embed_dims = [96, 192, 192, 192]
+    num_heads = [3, 6, 6, 6]
+    mlp_ratios = [3, 3, 3, 3]
+    downsamples = [True, False, False, False] # do downsampling after first block
+    outlook_attention = [True, False, False, False ]
+    # first block is outlooker (stage1), the other three are transformer (stage2)
+    model = VOLO(layers,
+                 embed_dims=embed_dims,
+                 num_heads=num_heads,
+                 mlp_ratios=mlp_ratios,
+                 downsamples=downsamples,
+                 outlook_attention=outlook_attention,
+                 post_layers=['ca', 'ca'],
+                 **kwargs)
+    model.default_cfg = default_cfgs['volo']
+    return model
 
 
 @register_model
