@@ -456,50 +456,100 @@ class PatchEmbed(nn.Module):
         self.stride = stem_stride
         self.patch_size = patch_size
         self.shuffle = shuffle
-        
-        if stem_conv:
-            self.conv = nn.Sequential(
-                nn.Conv2d(in_chans, hidden_dim, kernel_size=7, stride=stem_stride,
-                          padding=3, bias=False),  # 112x112
-                nn.BatchNorm2d(hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1,
-                          padding=1, bias=False),  # 112x112
-                nn.BatchNorm2d(hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1,
-                          padding=1, bias=False),  # 112x112
-                nn.BatchNorm2d(hidden_dim),
-                nn.ReLU(inplace=True),
-            )
-
-        self.proj = nn.Conv2d(hidden_dim,
-                              embed_dim,
-                              kernel_size=patch_size // stem_stride,
-                              stride=patch_size // stem_stride)
+        if self.shuffle:
+            self.hidden_dim = hidden_dim // 2
+            self.embed_dim = embed_dim // 2
+            hidden_dim = hidden_dim // 2
+            embed_dim = embed_dim // 2
+            
+        if not self.shuffle:
+            if stem_conv:
+                self.conv = nn.Sequential(
+                    nn.Conv2d(in_chans, hidden_dim, kernel_size=7, stride=stem_stride,
+                              padding=3, bias=False),  # 112x112
+                    nn.BatchNorm2d(hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1,
+                              padding=1, bias=False),  # 112x112
+                    nn.BatchNorm2d(hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1,
+                              padding=1, bias=False),  # 112x112
+                    nn.BatchNorm2d(hidden_dim),
+                    nn.ReLU(inplace=True),
+                )
+    
+            self.proj = nn.Conv2d(hidden_dim,
+                                  embed_dim,
+                                  kernel_size=patch_size // stem_stride,
+                                  stride=patch_size // stem_stride)
+        else:
+            if stem_conv:
+                self.conv_1 = nn.Conv2d(in_chans, hidden_dim * 2, kernel_size=7, stride=stem_stride, padding=3, bias=False)  # 112x112
+                self.norm_1 = nn.LayerNorm(in_chans)
+                self.acti_1 = nn.GELU()
+                self.conv_2 = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1, bias=False)  # 112x112
+                self.norm_2 = nn.LayerNorm(hidden_dim)
+                self.acti_2 = nn.GELU()
+                self.conv_3 = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1, bias=False)  # 112x112
+                self.norm_3 = nn.LayerNorm(hidden_dim)
+                self.acti_3 = nn.GELU()
+                self.norm_4 = nn.LayerNorm(hidden_dim)
+                self.norm_5 = nn.LayerNorm(hidden_dim)
+            self.proj_1 = nn.Conv2d(hidden_dim, embed_dim,
+                                    kernel_size=patch_size // stem_stride,
+                                    stride=patch_size // stem_stride)
+            self.proj_2 = nn.Conv2d(hidden_dim, embed_dim,
+                                    kernel_size=patch_size // stem_stride,
+                                    stride=patch_size // stem_stride)
         self.num_patches = (img_size // patch_size) * (img_size // patch_size)
 
     def forward(self, x):
-        if self.stem_conv:
-            x = self.conv(x)
-        x = self.proj(x)  # B, C, H, W
+        if not self.shuffle:
+            if self.stem_conv:
+                x = self.conv(x)
+            x = self.proj(x)  # B, C, H, W
+        else:
+            if self.stem_conv:
+                x = self.acti_1(self.conv_1(self.norm_1(x.permute(0,2,3,1)).permute(0,3,1,2)))
+                
+                x_half = x[:,:x.shape[1]//2,:,:] + self.acti_2(self.conv_2(self.norm_2(x[:,:x.shape[1]//2,:,:].permute(0,2,3,1)).permute(0,3,1,2)))
+                x = torch.cat((x_half, x[:,x.shape[1]//2:,:,:]), dim = 1)
+                x = x.reshape(x.shape[0], 2, x.shape[1]//2, x.shape[2], x.shape[3]).transpose(1,2).reshape(x.shape[0],x.shape[1],x.shape[2],x.shape[3])
+                
+                x_half = x[:,:x.shape[1]//2,:,: ] + self.acti_3(self.conv_3(self.norm_3(x[:,:x.shape[1]//2,:,:].permute(0,2,3,1)).permute(0,3,1,2)))
+                x = torch.cat((x_half, x[:,x.shape[1]//2:,:,:]), dim = 1)
+                x = x.reshape(x.shape[0], 2, x.shape[1]//2, x.shape[2], x.shape[3]).transpose(1,2).reshape(x.shape[0],x.shape[1],x.shape[2],x.shape[3])
+            
+            x = torch.cat((self.proj_1(self.norm_4(x[:,:x.shape[1]//2,:,:].permute(0,2,3,1)).permute(0,3,1,2)), 
+                           self.proj_2(self.norm_5(x[:,x.shape[1]//2:,:,:].permute(0,2,3,1)).permute(0,3,1,2))), dim=1)  # B, C, H, W
         return x
     
     def MACs(self, N):
         macs = 0
-        if self.stem_conv:
-            # x = self.conv(x)
-            macs = macs + 7 * 7 * self.in_chans * (N / self.stride**2) * self.hidden_dim
-            print("Conv1: ", 7 * 7 * self.in_chans * (N / self.stride**2) * self.hidden_dim)
-            # macs = macs + (N / self.stride**2) * self.hidden_dim
-            macs = macs + 3 * 3 * self.hidden_dim * (N / self.stride**2) * self.hidden_dim
-            print("Conv2: ", 3 * 3 * self.hidden_dim * (N / self.stride**2) * self.hidden_dim)
-            # macs = macs + (N / self.stride**2) * self.hidden_dim
-            macs = macs + 3 * 3 * self.hidden_dim * (N / self.stride**2) * self.hidden_dim
-            print("Conv3: ", 3 * 3 * self.hidden_dim * (N / self.stride**2) * self.hidden_dim)
-            # macs = macs + (N / self.stride**2) * self.hidden_dim
-        macs = macs + ((self.patch_size // self.stride) ** 2) * self.hidden_dim * self.embed_dim * self.num_patches
-        print("Conv3: ", ((self.patch_size // self.stride) ** 2) * self.hidden_dim * self.embed_dim * self.num_patches)
+        if not self.shuffle:
+            if self.stem_conv:
+                # x = self.conv(x)
+                macs = macs + 7 * 7 * self.in_chans * (N / self.stride**2) * self.hidden_dim
+                macs = macs + 3 * 3 * self.hidden_dim * (N / self.stride**2) * self.hidden_dim
+                macs = macs + 3 * 3 * self.hidden_dim * (N / self.stride**2) * self.hidden_dim
+            # x = proj(x)
+            macs = macs + ((self.patch_size // self.stride) ** 2) * self.hidden_dim * self.embed_dim * self.num_patches
+            print("Conv4: ", ((self.patch_size // self.stride) ** 2) * self.hidden_dim * self.embed_dim * self.num_patches)
+        else:
+            if self.stem_conv:
+                # x = self.conv_1(self.norm_1(x))
+                macs = macs + N * self.in_chans
+                macs = macs + 7 * 7 * self.in_chans * (N / self.stride**2) * self.hidden_dim * 2
+                # x = self.conv_2(self.norm_2(x))
+                macs = macs + (N / self.stride**2) * self.hidden_dim
+                macs = macs + 3 * 3 * self.hidden_dim * (N / self.stride**2) * self.hidden_dim
+                # x = self.conv_3(self.norm_3(x))
+                macs = macs + (N / self.stride**2) * self.hidden_dim
+                macs = macs + 3 * 3 * self.hidden_dim * (N / self.stride**2) * self.hidden_dim
+            # x = torch.cat(self.proj_1(self.norm_4(x), self.proj_2(self.norm_5(x)))
+            macs = macs + self.num_patches * self.hidden_dim * 2
+            macs = macs + ((self.patch_size // self.stride) ** 2) * self.hidden_dim * self.embed_dim * self.num_patches * 2
         return macs
 
 class Downsample(nn.Module):
@@ -901,7 +951,7 @@ def volo_d0_shuffle(pretrained=False, **kwargs):
     --post_layers: post layers like two class attention layers using [ca, ca]
     See detail for all args in the class VOLO()
     """
-    layers = [2, 2, 4, 2]  # num of layers in the four blocks
+    layers = [4, 4, 8, 2] # 2,2,4,2 # num of layers in the four blocks
     embed_dims = [96, 192, 192, 192]
     num_heads = [3, 6, 6, 6]
     mlp_ratios = [3, 3, 3, 3]
