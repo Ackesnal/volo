@@ -521,8 +521,9 @@ class PatchEmbed(nn.Module):
                 x = torch.cat((x_half, x[:,x.shape[1]//2:,:,:]), dim = 1)
                 x = x.reshape(x.shape[0], 2, x.shape[1]//2, x.shape[2], x.shape[3]).transpose(1,2).reshape(x.shape[0],x.shape[1],x.shape[2],x.shape[3])
             
-            x = torch.cat((self.proj_1(self.norm_4(x[:,:x.shape[1]//2,:,:].permute(0,2,3,1)).permute(0,3,1,2)), 
-                           self.proj_2(self.norm_5(x[:,x.shape[1]//2:,:,:].permute(0,2,3,1)).permute(0,3,1,2))), dim=1)  # B, C, H, W
+            x_1 = self.proj_1(self.norm_4(x[:,:x.shape[1]//2,:,:].permute(0,2,3,1)))
+            x_2 = self.proj_2(self.norm_5(x[:,x.shape[1]//2:,:,:].permute(0,2,3,1)))
+            x = torch.cat((x_1, x_2), dim=1).permute(0,3,1,2)  # B, C, H, W
         return x
     
     def MACs(self, N):
